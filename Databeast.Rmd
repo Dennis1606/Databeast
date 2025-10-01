@@ -3,3 +3,58 @@ title: "Databeast"
 output: html_document
 date: "2025-10-01"
 ---
+
+```{r}
+# Load libraries
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(janitor)
+library(ggplot2)
+library(visdat)
+
+raw = read.csv("dynamic_supply_chain_logistics_dataset.csv")
+
+df = raw
+
+df = df %>%
+  mutate(timestamp = ymd_hms(timestamp))
+
+df = df %>%
+  mutate(risk_classification = as.factor(risk_classification))
+
+df = df %>%
+  filter(between(vehicle_gps_latitude, -90, 90),
+         between(vehicle_gps_longitude, -180, 180))
+
+# Checking for the data missingness
+visdat::vis_miss(df) + theme(axis.text.x = element_text(angle = 90, hjust = 0))
+
+# Function to normalise numeric variables into 4 decimals 
+# We decided to round up the values to get generalised data but in a level 
+# that still shows distinct patterns thus, 4 decimals
+
+round_numeric = function(.data, digits = 4, exclude = NULL) {
+  mutate(
+    .data,
+    across(
+      .cols = where(is.numeric) & !any_of(exclude),
+      .fns = ~ round(.x, digits)
+    )
+  )
+}
+
+df = round_numeric(df, digits = 4,
+                   exclude = c("vehicle_gps_latitude",
+                               "vehicle_gps_longitude")
+)
+
+# Time Data 
+
+# Convert data into hours 
+df = df %>%
+  mutate(
+    customs_clearance_time = customs_clearance_time * 24
+  )
+
+```
