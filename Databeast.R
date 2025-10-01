@@ -1,3 +1,1 @@
-colinganteng
-asherkumis
-michi
+asher ganteng banget
