@@ -1,34 +1,29 @@
 # Load libraries
+library(tidyverse)
 library(dplyr)
 library(lubridate)
 library(janitor)
+library(ggplot2)
 
-# 1. Read the CSV
-df <- read.csv("dynamic_supply_chain_logistics_dataset.csv")
+raw = read.csv("dynamic_supply_chain_logistics_dataset.csv")
 
-# 2. Clean column names (snake_case, consistent)
-df <- janitor::clean_names(df)
+raw = janitor::clean_names(raw)
 
-# 3. Convert timestamp column to proper datetime
-df <- df %>%
+raw = raw %>%
   mutate(timestamp = ymd_hms(timestamp))
 
-# 4. Convert categorical variables to factors
-df <- df %>%
+raw = raw %>%
   mutate(risk_classification = as.factor(risk_classification))
 
-# 5. Check for duplicates and remove them
-df <- df %>%
+raw = raw %>%
   distinct()
 
-# 6. Handle outliers (example: unrealistic gps coords)
-df <- df %>%
+raw = raw %>%
   filter(between(vehicle_gps_latitude, -90, 90),
          between(vehicle_gps_longitude, -180, 180))
-
-# 7. Verify no missing values (should be none, but good to check)
-sum(is.na(df))
 
 # 8. Optional: scale/normalize continuous variables if needed
 # df <- df %>%
 #   mutate(across(where(is.numeric), scale))
+
+str(df)
