@@ -5,56 +5,672 @@ date: "2025-10-01"
 ---
 
 ```{r}
-# Load libraries
+# ============================== PACKAGES ==============================
+suppressPackageStartupMessages({
+  library(tidyverse)   # dplyr, tidyr, stringr, ggplot2
+  library(xgboost)
+  library(lubridate)
+  library(janitor)
+  library(ggplot2)
+  library(ranger)
+  library(forcats)
+  library(scales)
+})
+
+# ----------------- small metric helpers -----------------
+rmse  <- function(y, yhat) sqrt(mean((y - yhat)^2))
+mae   <- function(y, yhat) mean(abs(y - yhat))
+r2fun <- function(y, yhat) 1 - sum((y - yhat)^2)/sum((y - mean(y))^2)
+
+macro_f1 <- function(truth, pred, labels){
+  f1s <- sapply(labels, function(L){
+    tp <- sum(truth==L & pred==L)
+    fp <- sum(truth!=L & pred==L)
+    fn <- sum(truth==L & pred!=L)
+    prec <- if ((tp+fp)==0) 0 else tp/(tp+fp)
+    rec  <- if ((tp+fn)==0) 0 else tp/(tp+fn)
+    if ((prec+rec)==0) 0 else 2*prec*rec/(prec+rec)
+  })
+  mean(f1s)
+}
+balanced_acc <- function(truth, pred, labels){
+  recs <- sapply(labels, function(L){
+    tp <- sum(truth==L & pred==L)
+    fn <- sum(truth==L & pred!=L)
+    if ((tp+fn)==0) 0 else tp/(tp+fn)
+  })
+  mean(recs)
+}
+
+# collapse dummy/one-hot columns to their base variable names (for clean axes)
+map_to_base <- function(cols, orig_vars){
+  sapply(cols, function(cn){
+    cn0 <- sub("\\.[0-9]+$", "", cn)
+    cand <- orig_vars[startsWith(cn0, orig_vars)]
+    if (length(cand) == 0) cn0 else cand[which.max(nchar(cand))]
+  }, USE.NAMES = FALSE)
+}
+
+# ============================== SETTINGS ==============================
+DROP_LEAKAGE <- TRUE
+TRAIN_PROP   <- 0.20
+NROUNDS      <- 80
+SEED         <- 42
+
+# ============================== LOAD + CLEAN ==============================
 library(tidyverse)
-library(dplyr)
 library(lubridate)
 library(janitor)
 library(ggplot2)
 library(visdat)
 
-raw = read.csv("dynamic_supply_chain_logistics_dataset.csv")
+# Load RAW file (as per slide)
+df <- readr::read_csv("dynamic_supply_chain_logistics_dataset.csv", show_col_types = FALSE)
 
-df = raw
+# Parse timestamp
+df <- df %>% mutate(timestamp = ymd_hms(timestamp))
 
-df = df %>%
-  mutate(timestamp = ymd_hms(timestamp))
+# Factorise target
+df <- df %>% mutate(risk_classification = as.factor(risk_classification))
 
-df = df %>%
-  mutate(risk_classification = as.factor(risk_classification))
-
-df = df %>%
+# GPS sanity filter
+df <- df %>%
   filter(between(vehicle_gps_latitude, -90, 90),
          between(vehicle_gps_longitude, -180, 180))
 
-# Checking for the data missingness
+# Visualise missingness (no imputation here)
 visdat::vis_miss(df) + theme(axis.text.x = element_text(angle = 90, hjust = 0))
 
-# Function to normalise numeric variables into 4 decimals 
-# We decided to round up the values to get generalised data but in a level 
-# that still shows distinct patterns thus, 4 decimals
+# Round numeric vars to 4 decimals, excluding lat/long
+round_numeric <- function(.data, digits = 4, exclude = NULL) {
+  mutate(.data,
+         across(where(is.numeric) & !any_of(exclude), ~ round(.x, digits)))
+}
+df <- round_numeric(df, digits = 4,
+                    exclude = c("vehicle_gps_latitude", "vehicle_gps_longitude"))
 
-round_numeric = function(.data, digits = 4, exclude = NULL) {
-  mutate(
-    .data,
-    across(
-      .cols = where(is.numeric) & !any_of(exclude),
-      .fns = ~ round(.x, digits)
-    )
-  )
+# Convert customs_clearance_time from days to hours
+if ("customs_clearance_time" %in% names(df)) {
+  df <- df %>% mutate(customs_clearance_time = customs_clearance_time * 24)
 }
 
-df = round_numeric(df, digits = 4,
-                   exclude = c("vehicle_gps_latitude",
-                               "vehicle_gps_longitude")
+# ============================== 20/80 SPLIT ==============================
+set.seed(SEED)
+train_idx <- df %>%
+  mutate(.row = row_number()) %>%
+  group_by(risk_classification) %>%
+  slice_sample(prop = TRAIN_PROP) %>%
+  pull(.row)
+train <- df[train_idx, , drop = FALSE]
+test  <- df[-train_idx, , drop = FALSE]
+
+# ============================== Label distribution (sanity) ==============================
+lab_df <- as.data.frame(table(df$risk_classification))
+names(lab_df) <- c("class", "count")
+lab_df$prop <- lab_df$count / sum(lab_df$count)
+print(lab_df)
+ggplot(lab_df, aes(x=class, y=prop)) +
+  geom_col() +
+  scale_y_continuous(labels=scales::percent) +
+  labs(title="Label distribution", x="", y="Share") +
+  theme_minimal()
+
+# ============================== BASELINES ==============================
+majority_class <- names(which.max(table(train$risk_classification)))
+pred_baseline_class <- factor(rep(majority_class, nrow(test)),
+                              levels = levels(train$risk_classification))
+baseline_acc <- mean(pred_baseline_class == test$risk_classification)
+
+p_high_train <- mean(train$risk_classification == "High Risk")
+yte_high     <- as.integer(test$risk_classification == "High Risk")
+baseline_rmse <- rmse(yte_high, rep(p_high_train, length(yte_high)))
+baseline_mae  <- mae(yte_high, rep(p_high_train, length(yte_high)))
+baseline_r2   <- r2fun(yte_high, rep(p_high_train, length(yte_high)))
+
+cat("\n=== BASELINES (from TRAIN) ===\n")
+cat(sprintf("Majority-class baseline Accuracy: %.4f (class = %s)\n",
+            baseline_acc, majority_class))
+cat(sprintf("High-Risk prob baseline (p=%.3f) — RMSE: %.4f  MAE: %.4f  R^2: %.4f\n",
+            p_high_train, baseline_rmse, baseline_mae, baseline_r2))
+
+# ============================== XGBOOST (MAIN MODEL) ==============================
+# design matrices (one-hot) + column alignment
+mmatrix <- function(dat, y = "risk_classification") {
+  X <- model.matrix(reformulate(setdiff(names(dat), y)), data = dat)
+  X <- X[, colnames(X) != "(Intercept)", drop = FALSE]
+  list(X = X, y = dat[[y]])
+}
+mm_tr <- mmatrix(train); mm_te <- mmatrix(test)
+
+# align test to train
+miss_cols <- setdiff(colnames(mm_tr$X), colnames(mm_te$X))
+if (length(miss_cols)) {
+  add <- matrix(0, nrow = nrow(mm_te$X), ncol = length(miss_cols),
+                dimnames = list(NULL, miss_cols))
+  mm_te$X <- cbind(mm_te$X, add)
+}
+extra_cols <- setdiff(colnames(mm_te$X), colnames(mm_tr$X))
+if (length(extra_cols)) {
+  mm_te$X <- mm_te$X[, setdiff(colnames(mm_te$X), extra_cols), drop = FALSE]
+}
+mm_te$X <- mm_te$X[, colnames(mm_tr$X), drop = FALSE]
+
+Xtr <- mm_tr$X; Xte <- mm_te$X
+ytr <- mm_tr$y; yte <- mm_te$y
+levels_y <- levels(ytr); num_class <- length(levels_y)
+orig_vars <- setdiff(names(train), "risk_classification")
+
+dtrain <- xgb.DMatrix(Xtr, label = as.integer(ytr) - 1)
+dtest  <- xgb.DMatrix(Xte, label = as.integer(yte) - 1)
+
+params <- list(
+  objective = "multi:softprob",
+  num_class = num_class,
+  eval_metric = "mlogloss",
+  eta = 0.1, max_depth = 6, subsample = 0.8, colsample_bytree = 0.8
 )
 
-# Time Data 
+set.seed(SEED)
+xgb_model <- xgb.train(params, dtrain, nrounds = NROUNDS, verbose = 0)
 
-# Convert data into hours 
-df = df %>%
-  mutate(
-    customs_clearance_time = customs_clearance_time * 24
-  )
+# predictions + metrics (initial model)
+prob_vec <- predict(xgb_model, dtest)
+prob_mat <- matrix(prob_vec, ncol = num_class, byrow = TRUE)
+colnames(prob_mat) <- levels_y
+pred_ix  <- max.col(prob_mat) - 1
+pred_class <- factor(levels_y[pred_ix + 1], levels = levels_y)
 
-```
+cat("\n--- XGBoost: Confusion Matrix (20% train / 80% test) ---\n")
+print(table(Predicted = pred_class, Actual = yte))
+acc_xgb <- mean(pred_class == yte)
+cat(sprintf("\nXGBoost Accuracy: %.4f  (vs baseline %.4f)\n", acc_xgb, baseline_acc))
+
+p_high_xgb <- prob_mat[, which(levels_y == "High Risk")]
+rmse_xgb <- rmse(yte_high, p_high_xgb)
+mae_xgb  <- mae(yte_high, p_high_xgb)
+r2_xgb   <- r2fun(yte_high, p_high_xgb)
+cat(sprintf("XGBoost Prob(High Risk) — RMSE: %.4f  MAE: %.4f  R^2: %.4f  (baseline RMSE: %.4f, MAE: %.4f, R^2: %.4f)\n",
+            rmse_xgb, mae_xgb, r2_xgb, baseline_rmse, baseline_mae, baseline_r2))
+
+
+# ============================== RANDOM FOREST (BASELINE MODEL) ==============================
+set.seed(SEED)
+rf <- ranger::ranger(
+  risk_classification ~ ., data = train,
+  probability = TRUE, num.trees = 800,
+  importance = "permutation", seed = SEED
+)
+rf_pred <- predict(rf, test)
+pred_rf_prob <- rf_pred$predictions
+rf_levels <- colnames(pred_rf_prob)
+if (is.null(rf_levels)) {
+  rf_levels <- tryCatch(rf$forest$levels, error = function(e) NULL)
+  if (is.null(rf_levels)) rf_levels <- levels_y
+  colnames(pred_rf_prob) <- rf_levels
+} else {
+  colnames(pred_rf_prob) <- trimws(rf_levels)
+  rf_levels <- colnames(pred_rf_prob)
+}
+rf_prob_full <- matrix(0, nrow = nrow(pred_rf_prob), ncol = length(levels_y))
+colnames(rf_prob_full) <- levels_y
+common <- intersect(levels_y, rf_levels)
+rf_prob_full[, common] <- pred_rf_prob[, common, drop = FALSE]
+
+pred_rf_ix  <- max.col(rf_prob_full) - 1
+pred_rf_fac <- factor(levels_y[pred_rf_ix + 1], levels = levels_y)
+
+cat("\n--- Random Forest (baseline model): Confusion Matrix ---\n")
+print(table(Predicted = pred_rf_fac, Actual = yte))
+acc_rf <- mean(pred_rf_fac == yte)
+cat(sprintf("\nRandom Forest Accuracy: %.4f  (vs baseline %.4f)\n", acc_rf, baseline_acc))
+
+p_high_rf <- rf_prob_full[, "High Risk"]
+rmse_rf <- rmse(yte_high, p_high_rf)
+mae_rf  <- mae(yte_high, p_high_rf)
+r2_rf   <- r2fun(yte_high, p_high_rf)
+cat(sprintf("RF Prob(High Risk) — RMSE: %.4f  MAE: %.4f  R^2: %.4f  (baseline RMSE: %.4f, MAE: %.4f, R^2: %.4f)\n",
+            rmse_rf, mae_rf, r2_rf, baseline_rmse, baseline_mae, baseline_r2))
+# ============================== XGBoost (class-weighted to fix imbalance) ==============================
+tbl <- table(train$risk_classification)
+w_per_class <- 1 / as.numeric(tbl); names(w_per_class) <- names(tbl)
+row_wts <- w_per_class[as.character(train$risk_classification)]
+
+dtrain_w <- xgboost::xgb.DMatrix(data = Xtr,
+                                 label = as.integer(ytr) - 1,
+                                 weight = row_wts)
+
+set.seed(42)
+xgb_imb_model <- xgboost::xgb.train(
+  params = list(
+    objective = "multi:softprob",
+    num_class = length(levels_y),
+    eval_metric = "mlogloss",
+    eta = 0.08, max_depth = 6, subsample = 0.9, colsample_bytree = 0.9
+  ),
+  data = dtrain_w,
+  nrounds = 400,
+  verbose = 0
+)
+
+# Predict on TEST
+prob_vec_imb <- predict(xgb_imb_model, dtest)
+prob_mat_imb <- matrix(prob_vec_imb, ncol = length(levels_y), byrow = TRUE)
+colnames(prob_mat_imb) <- levels_y
+pred_class_imb <- factor(levels_y[max.col(prob_mat_imb)], levels = levels_y)
+
+# Imbalance-aware metrics + confusion matrix
+acc_imb  <- mean(pred_class_imb == yte)
+mF1_imb  <- macro_f1(yte, pred_class_imb, levels_y)
+bAcc_imb <- balanced_acc(yte, pred_class_imb, levels_y)
+cat(sprintf("\n[Imbalance-fixed XGB] Acc: %.3f | Macro-F1: %.3f | Balanced Acc: %.3f\n",
+            acc_imb, mF1_imb, bAcc_imb))
+
+cm_imb <- as.data.frame(table(Actual=yte, Pred=pred_class_imb)) |>
+  dplyr::group_by(Actual) |>
+  dplyr::mutate(Prop = Freq/sum(Freq)) |>
+  dplyr::ungroup()
+p_cm_imb <- ggplot2::ggplot(cm_imb, aes(Pred, Actual, fill=Prop)) +
+  geom_tile(color="white") +
+  geom_text(aes(label=scales::percent(Prop, accuracy=0.1)), size=3) +
+  scale_fill_gradient(low="#f0f0f0", high="#1f78b4") +
+  labs(title="XGBoost (class-weighted) — Confusion Matrix", x="Predicted", y="Actual") +
+  theme_minimal()
+print(p_cm_imb); ggsave("cm_xgb_class_weighted.png", p_cm_imb, width=8, height=5, dpi=300)
+
+# ============================== Platt Calibration (High Risk one-vs-rest) ==============================
+# Make a small validation split inside TRAIN (no leakage into TEST)
+set.seed(42)
+val_idx <- train %>%
+  dplyr::mutate(.row=row_number()) %>%
+  dplyr::group_by(risk_classification) %>%
+  dplyr::slice_sample(prop=0.2) %>% dplyr::pull(.row)
+
+train_cal <- train[-val_idx, , drop=FALSE]
+val_cal   <- train[val_idx,  , drop=FALSE]
+
+# design matrices using your mmatrix() + alignment
+mm_tr_cal <- mmatrix(train_cal); mm_val_cal <- mmatrix(val_cal)
+miss_cols <- setdiff(colnames(mm_tr_cal$X), colnames(mm_val_cal$X))
+if (length(miss_cols)) {
+  add <- matrix(0, nrow=nrow(mm_val_cal$X), ncol=length(miss_cols),
+                dimnames=list(NULL, miss_cols))
+  mm_val_cal$X <- cbind(mm_val_cal$X, add)
+}
+extra <- setdiff(colnames(mm_val_cal$X), colnames(mm_tr_cal$X))
+if (length(extra)) mm_val_cal$X <- mm_val_cal$X[, setdiff(colnames(mm_val_cal$X), extra), drop=FALSE]
+mm_val_cal$X <- mm_val_cal$X[, colnames(mm_tr_cal$X), drop=FALSE]
+
+# train a small class-weighted XGB on train_cal
+tbl_cal <- table(train_cal$risk_classification)
+wpc_cal <- 1 / as.numeric(tbl_cal); names(wpc_cal) <- names(tbl_cal)
+row_wts_cal <- wpc_cal[as.character(train_cal$risk_classification)]
+
+dtr_cal <- xgb.DMatrix(mm_tr_cal$X, label=as.integer(mm_tr_cal$y)-1, weight=row_wts_cal)
+dva_cal <- xgb.DMatrix(mm_val_cal$X, label=as.integer(mm_val_cal$y)-1)
+
+set.seed(42)
+xgb_cal_model <- xgb.train(
+  params=list(objective="multi:softprob", num_class=length(levels_y),
+              eval_metric="mlogloss", eta=0.08, max_depth=6,
+              subsample=0.9, colsample_bytree=0.9),
+  data=dtr_cal, nrounds=300, verbose=0
+)
+
+# Get raw High-Risk probs on validation
+raw_val <- matrix(predict(xgb_cal_model, dva_cal),
+                  ncol=length(levels_y), byrow=TRUE)
+colnames(raw_val) <- levels_y
+y_val_high <- as.integer(val_cal$risk_classification == "High Risk")
+p_raw_val_high <- raw_val[, "High Risk"]
+
+# Fit Platt scaler (logistic regression)
+cal_platt <- glm(y_val_high ~ p_raw_val_high, family=binomial())
+
+# Apply calibration to TEST probabilities from class-weighted model
+p_test_raw_high <- prob_mat_imb[, "High Risk"]
+p_test_cal_high <- predict(cal_platt,
+                           newdata = data.frame(p_raw_val_high = p_test_raw_high),
+                           type = "response")
+
+# Reliability curves (raw vs calibrated) on TEST
+bin_plot <- function(score, y, n_bins=10){
+  br <- quantile(score, probs = seq(0,1,length.out=n_bins+1), na.rm=TRUE)
+  br[1] <- 0; br[length(br)] <- 1
+  cut_s <- cut(score, breaks=unique(br), include.lowest=TRUE, labels=FALSE)
+  tibble(bin=cut_s, score=score, y=y) |>
+    dplyr::group_by(bin) |>
+    dplyr::summarise(p_hat = mean(score), obs = mean(y), .groups="drop")
+}
+y_true_high <- as.integer(yte == "High Risk")
+raw_b  <- bin_plot(p_test_raw_high, y_true_high, 10)
+cal_b  <- bin_plot(p_test_cal_high, y_true_high, 10)
+
+p_cal_raw <- ggplot(raw_b, aes(p_hat, obs)) +
+  geom_line() + geom_point() + geom_abline(linetype=2) +
+  scale_y_continuous(labels=scales::percent) +
+  scale_x_continuous(labels=scales::percent) +
+  labs(title="Calibration — XGBoost RAW (High Risk)",
+       x="Predicted probability (bin avg)", y="Observed frequency") +
+  theme_minimal()
+
+p_cal_fix <- ggplot(cal_b, aes(p_hat, obs)) +
+  geom_line() + geom_point() + geom_abline(linetype=2) +
+  scale_y_continuous(labels=scales::percent) +
+  scale_x_continuous(labels=scales::percent) +
+  labs(title="Calibration — XGBoost PLATT (High Risk)",
+       x="Predicted probability (bin avg)", y="Observed frequency") +
+  theme_minimal()
+
+print(p_cal_raw); ggsave("calibration_xgb_raw.png",  p_cal_raw,  width=8, height=5, dpi=300)
+print(p_cal_fix); ggsave("calibration_xgb_platt.png", p_cal_fix, width=8, height=5, dpi=300)
+
+# ============================== PR-AUC and Precision@k (High Risk vs Rest) ==============================
+y_true <- as.integer(yte == "High Risk")
+scores <- prob_mat_imb[, "High Risk"]   # <-- or use p_test_cal_high if you want calibrated scores
+
+ord <- order(scores, decreasing = TRUE)
+y_sorted <- y_true[ord]
+tp <- cumsum(y_sorted); fp <- cumsum(1 - y_sorted)
+prec <- tp / pmax(tp + fp, 1); rec <- tp / sum(y_true)
+
+# PR-AUC (trapezoidal)
+auprc <- sum( (rec[-1] - rec[-length(rec)]) * (prec[-1] + prec[-length(prec)]) / 2 )
+cat(sprintf("\nPR-AUC (High Risk vs Rest): %.3f\n", auprc))
+
+# Precision@k curve
+k_vals <- seq(0.05, 0.5, by=0.05)  # 5% to 50%
+p_at_k <- sapply(k_vals, function(k){
+  kN <- ceiling(k * length(scores))
+  mean(y_sorted[1:kN] == 1)
+})
+prec_k_df <- tibble::tibble(k = k_vals, precision = p_at_k)
+
+p_pk <- ggplot2::ggplot(prec_k_df, aes(x = k, y = precision)) +
+  geom_line() + geom_point() +
+  scale_x_continuous(labels=scales::percent) +
+  scale_y_continuous(labels=scales::percent) +
+  labs(title="Precision @ k (High Risk triage)",
+       x="Top-k proportion triaged", y="Precision among triaged") +
+  theme_minimal()
+print(p_pk); ggsave("precision_at_k.png", p_pk, width=8, height=5, dpi=300)
+
+# ============================== Feature engineering + retrain (QUICK DEV) ==============================
+FAST_DEV_FRAC <- 0.5  # use only 50% of TRAIN rows for quick iteration
+set.seed(42)
+train_quick <- train %>% dplyr::slice_sample(prop = FAST_DEV_FRAC)
+test_quick  <- test   # keep full test to evaluate honestly
+
+# Lightweight featurization (fewer buckets, NO GPS tiles, NO heavy interactions)
+featurize_quick <- function(d){
+  d %>%
+    mutate(
+      lead_time_bucket = cut(lead_time_days, breaks=c(-Inf, 3, 7, Inf),
+                             labels=c("short","med","long")),
+      fatigue_bucket   = cut(fatigue_monitoring_score, breaks=c(-Inf, 40, 70, Inf),
+                             labels=c("low","med","high")),
+      congestion_bucket = cut(traffic_congestion_level, breaks=c(-Inf, 0.4, 0.7, Inf),
+                              labels=c("low","med","high"))
+      # NOTE: no GPS tiles, no portXweather, no trafficXdock to keep matrix small
+    )
+}
+train2 <- featurize_quick(train_quick)
+test2  <- featurize_quick(test_quick)
+
+mm_tr2 <- mmatrix(train2); mm_te2 <- mmatrix(test2)
+miss <- setdiff(colnames(mm_tr2$X), colnames(mm_te2$X))
+if (length(miss)) {
+  add <- matrix(0, nrow=nrow(mm_te2$X), ncol=length(miss), dimnames=list(NULL, miss))
+  mm_te2$X <- cbind(mm_te2$X, add)
+}
+extra <- setdiff(colnames(mm_te2$X), colnames(mm_tr2$X))
+if (length(extra)) mm_te2$X <- mm_te2$X[, setdiff(colnames(mm_te2$X), extra), drop=FALSE]
+mm_te2$X <- mm_te2$X[, colnames(mm_tr2$X), drop=FALSE]
+
+# class weights on the quick train
+tbl2 <- table(train2$risk_classification)
+wpc2 <- 1/as.numeric(tbl2); names(wpc2) <- names(tbl2)
+row_wts2 <- wpc2[as.character(train2$risk_classification)]
+
+dtr2 <- xgb.DMatrix(mm_tr2$X, label=as.integer(mm_tr2$y)-1, weight=row_wts2)
+dte2 <- xgb.DMatrix(mm_te2$X, label=as.integer(mm_te2$y)-1)
+
+set.seed(42)
+xgb_feat_model <- xgb.train(
+  params=list(
+    objective="multi:softprob", num_class=length(levels_y),
+    eval_metric="mlogloss",
+    eta=0.12, max_depth=5, subsample=0.9, colsample_bytree=0.9,
+    tree_method = "hist",      # fast
+    nthread = max(1, parallel::detectCores() - 1)
+  ),
+  data=dtr2,
+  nrounds=120,                 # << cut from 500 to 120
+  verbose=0
+)
+
+prob2 <- matrix(predict(xgb_feat_model, dte2), ncol=length(levels_y), byrow=TRUE)
+colnames(prob2) <- levels_y
+pred2 <- factor(levels_y[max.col(prob2)], levels=levels_y)
+
+cat(sprintf("\n[QUICK DEV] Acc: %.3f | Macro-F1: %.3f | Balanced Acc: %.3f\n",
+            mean(pred2==yte), macro_f1(yte,pred2,levels_y), balanced_acc(yte,pred2,levels_y)))
+
+# ============================== SHAP (ROBUST) ==============================
+# Handles list/sparse outputs; safe bias removal; safe naming
+suppressWarnings({
+  rbind_align <- function(mats) {
+    mats <- lapply(mats, function(M){
+      if (inherits(M, "dgCMatrix") || inherits(M, "sparseMatrix")) M <- as.matrix(M)
+      as.matrix(M)
+    })
+    any_names <- any(vapply(mats, function(M) !is.null(colnames(M)), logical(1)))
+    if (!any_names) return(do.call(rbind, mats))
+    all_cols <- Reduce(union, lapply(mats, colnames))
+    filled <- lapply(mats, function(M){
+      miss <- setdiff(all_cols, colnames(M))
+      if (length(miss)) {
+        add <- matrix(0, nrow = nrow(M), ncol = length(miss),
+                      dimnames = list(NULL, miss))
+        M <- cbind(M, add)
+      }
+      M[, all_cols, drop = FALSE]
+    })
+    do.call(rbind, filled)
+  }
+  
+  shap_raw <- predict(xgb_model, dtest, predcontrib = TRUE)
+  if (is.list(shap_raw)) {
+    shap_mat <- rbind_align(shap_raw)
+  } else if (inherits(shap_raw, "dgCMatrix") || inherits(shap_raw, "sparseMatrix")) {
+    shap_mat <- as.matrix(shap_raw)
+  } else {
+    shap_mat <- as.matrix(shap_raw)
+  }
+  nr <- nrow(shap_mat); nc <- ncol(shap_mat)
+  shap_mat <- matrix(suppressWarnings(as.numeric(shap_mat)),
+                     nrow = nr, ncol = nc, dimnames = dimnames(shap_mat))
+  
+  feat_names_model <- colnames(dtest)
+  cn <- colnames(shap_mat)
+  has_bias_name <- !is.null(cn) && any(grepl("bias", cn, ignore.case = TRUE))
+  has_bias_size <- (!is.null(nc)) && (nc == length(feat_names_model) + 1L)
+  if (has_bias_name) {
+    shap_mat <- shap_mat[, !grepl("bias", cn, ignore.case = TRUE), drop = FALSE]
+  } else if (has_bias_size) {
+    shap_mat <- shap_mat[, seq_len(ncol(shap_mat) - 1L), drop = FALSE]
+  }
+  if (is.null(colnames(shap_mat)) || length(colnames(shap_mat)) != length(feat_names_model)) {
+    if (ncol(shap_mat) == length(feat_names_model)) {
+      colnames(shap_mat) <- feat_names_model
+    } else {
+      colnames(shap_mat) <- paste0("f", seq_len(ncol(shap_mat)))
+    }
+  }
+  
+  shap_mean_abs <- colMeans(abs(shap_mat), na.rm = TRUE)
+  shap_tbl <- tibble(
+    feature = names(shap_mean_abs),
+    mean_abs_shap = as.numeric(shap_mean_abs)
+  ) %>% arrange(desc(mean_abs_shap))
+  cat("\nTop-15 SHAP (mean |contribution|):\n"); print(head(shap_tbl, 15))
+  
+  # quick SHAP beeswarm for top 10
+  top_feats <- shap_tbl$feature[1:min(10, nrow(shap_tbl))]
+  plot_df <- as_tibble(shap_mat[, top_feats, drop = FALSE], .name_repair = "minimal") %>%
+    mutate(.row = row_number()) %>%
+    pivot_longer(-.row, names_to = "feature", values_to = "shap") %>%
+    mutate(feature = factor(feature, levels = rev(top_feats)))
+  p_shap_bee <- ggplot(plot_df, aes(x = shap, y = feature)) +
+    geom_point(alpha = 0.35, size = 1.2, position = position_jitter(height = 0.2)) +
+    geom_vline(xintercept = 0, linetype = 2, alpha = 0.6) +
+    labs(title = "XGBoost — SHAP Beeswarm (Top 10 features)",
+         x = "SHAP contribution (per row)", y = "") +
+    theme_minimal()
+  print(p_shap_bee); ggsave("shap_beeswarm_xgb.png", p_shap_bee, width = 8, height = 5, dpi = 300)
+})
+
+# ============================== Permutation importance (Δ log-loss, GROUPED + AUTOSCALED) ==============================
+eps <- 1e-15
+multi_logloss <- function(true_fac, prob_mat, levels_y){
+  Y <- model.matrix(~ true_fac - 1); colnames(Y) <- levels(true_fac)
+  Y <- Y[, levels_y, drop = FALSE]
+  -mean(rowSums(Y * log(pmax(prob_mat, eps))))
+}
+
+col_to_base <- map_to_base(colnames(Xte), orig_vars)
+base_prob <- matrix(predict(xgb_model, xgb.DMatrix(Xte)),
+                    ncol = length(levels_y), byrow = TRUE)
+base_ll <- multi_logloss(yte, base_prob, levels_y)
+
+set.seed(SEED)
+base_features <- unique(col_to_base)
+perm_group <- function(feat_name, B = 3){
+  idx_cols <- which(col_to_base == feat_name)
+  if (length(idx_cols) == 0) return(0)
+  vals <- numeric(B)
+  for (b in 1:B){
+    Xp <- Xte
+    perm <- sample(nrow(Xp))
+    Xp[, idx_cols] <- Xp[perm, idx_cols, drop = FALSE]
+    pp <- matrix(predict(xgb_model, xgb.DMatrix(Xp)),
+                 ncol = length(levels_y), byrow = TRUE)
+    vals[b] <- multi_logloss(yte, pp, levels_y)
+  }
+  mean(vals) - base_ll
+}
+delta_by_feat <- sapply(base_features, perm_group, B = 3)
+perm_base <- tibble(feature = base_features, delta_logloss = as.numeric(delta_by_feat)) %>%
+  mutate(delta_abs = abs(delta_logloss)) %>% arrange(desc(delta_abs))
+maxabs <- max(perm_base$delta_abs, na.rm = TRUE)
+scale_fac <- if (is.finite(maxabs) && maxabs > 0) 10^(max(0, ceiling(log10(100/maxabs)))) else 1
+perm_base <- perm_base %>% mutate(delta_scaled = delta_logloss * scale_fac)
+
+cat(sprintf("\n[Permutation Δ log-loss] max |Δ| = %.3e; scaling ×%s\n",
+            maxabs, label_scientific()(scale_fac)))
+cat("\nTop-15 Permutation (grouped, scaled):\n"); print(perm_base %>% slice_head(n = 15))
+
+ggplot(perm_base %>% slice_head(n = 15),
+       aes(delta_scaled, reorder(feature, delta_scaled))) +
+  geom_col() +
+  geom_vline(xintercept = 0, linetype = 2, alpha = 0.5) +
+  labs(
+    title = "Top-15 Permutation Importance (Δ log-loss, grouped by feature)",
+    x = paste0("Δ log-loss (scaled ×", label_scientific()(scale_fac), ")"),
+    y = "Feature"
+  ) +
+  theme_minimal()
+
+# ============================== METRICS & CONFUSION HEATMAP (XGB) ==============================
+acc_xgb  <- mean(pred_class == yte)
+mF1_xgb  <- macro_f1(yte, pred_class, levels_y)
+bAcc_xgb <- balanced_acc(yte, pred_class, levels_y)
+cat(sprintf("\nXGB — Acc: %.3f | Macro-F1: %.3f | Balanced Acc: %.3f\n",
+            acc_xgb, mF1_xgb, bAcc_xgb))
+
+cm_df <- as.data.frame(table(Actual=yte, Pred=pred_class)) %>%
+  group_by(Actual) %>% mutate(Prop = Freq / sum(Freq)) %>% ungroup()
+p_cm <- ggplot(cm_df, aes(Pred, Actual, fill=Prop)) +
+  geom_tile(color="white") +
+  geom_text(aes(label=scales::percent(Prop, accuracy=0.1)), size=3) +
+  scale_fill_gradient(low="#f0f0f0", high="#1f78b4") +
+  labs(title="XGBoost — Confusion Matrix (Proportions)", x="Predicted", y="Actual", fill="Prop") +
+  theme_minimal()
+print(p_cm); ggsave("cm_xgb.png", p_cm, width=8, height=5, dpi=300)
+
+# ============================== QUICK CV TUNING (and RE-EVALUATE) ==============================
+set.seed(SEED)
+cv <- xgboost::xgb.cv(
+  params = list(
+    objective="multi:softprob",
+    num_class=length(levels_y),
+    eval_metric=c("mlogloss","merror"),
+    eta=0.05, max_depth=6, subsample=0.9, colsample_bytree=0.9
+  ),
+  data = dtrain,
+  nrounds = 1000,
+  nfold = 5,
+  stratified = TRUE,
+  early_stopping_rounds = 50,
+  verbose = 0
+)
+best_nrounds <- cv$best_iteration
+cat("\nCV best nrounds:", best_nrounds, "\n")
+
+# retrain tuned model
+xgb_model <- xgb.train(cv$params, dtrain, nrounds = best_nrounds, verbose = 0)
+
+# predict again (tuned)
+prob_vec2 <- predict(xgb_model, dtest)
+prob_mat2 <- matrix(prob_vec2, ncol = num_class, byrow = TRUE); colnames(prob_mat2) <- levels_y
+pred_class2 <- factor(levels_y[max.col(prob_mat2)], levels = levels_y)
+
+acc_xgb2  <- mean(pred_class2 == yte)
+mF1_xgb2  <- macro_f1(yte, pred_class2, levels_y)
+bAcc_xgb2 <- balanced_acc(yte, pred_class2, levels_y)
+cat(sprintf("Tuned XGB — Acc: %.3f | Macro-F1: %.3f | Balanced Acc: %.3f (baseline Acc %.3f)\n",
+            acc_xgb2, mF1_xgb2, bAcc_xgb2, baseline_acc))
+
+# ============================== WHAT-IF ANALYSIS HELPERS ==============================
+labels <- levels(train$risk_classification)
+train_levels <- lapply(train, function(col) if (is.factor(col)) levels(col) else NULL)
+xgb_features <- colnames(mm_tr$X)
+
+coerce_to_train_levels <- function(df1row) {
+  out <- df1row
+  for (nm in names(train_levels)) {
+    if (!is.null(train_levels[[nm]]) && nm %in% names(out)) {
+      out[[nm]] <- factor(as.character(out[[nm]]), levels = train_levels[[nm]])
+    }
+  }
+  out
+}
+row_to_X <- function(df1row) {
+  df1row <- coerce_to_train_levels(df1row)
+  X <- model.matrix(risk_classification ~ ., df1row)
+  X <- X[, -1, drop = FALSE]
+  miss <- setdiff(xgb_features, colnames(X))
+  if (length(miss)) {
+    X <- cbind(X, matrix(0, nrow = nrow(X), ncol = length(miss),
+                         dimnames = list(NULL, miss)))
+  }
+  extra <- setdiff(colnames(X), xgb_features)
+  if (length(extra)) X <- X[, setdiff(colnames(X), extra), drop = FALSE]
+  X[, xgb_features, drop = FALSE]
+}
+what_if <- function(row_idx, feature, new_value) {
+  base <- test[row_idx, , drop = TRUE]
+  base <- as.data.frame(as.list(base), stringsAsFactors = FALSE)
+  changed <- base
+  changed[[feature]] <- new_value
+  X0 <- row_to_X(base); X1 <- row_to_X(changed)
+  p0 <- matrix(predict(xgb_model, xgb.DMatrix(X0)), ncol = length(labels), byrow = TRUE)
+  p1 <- matrix(predict(xgb_model, xgb.DMatrix(X1)), ncol = length(labels), byrow = TRUE)
+  colnames(p0) <- colnames(p1) <- labels
+  as.data.frame(round(rbind(before = p0, after = p1), 4))
+}
+
+# Example use:
+# idx <- which(pred_class2 == "High Risk")[1]
+# levels(train$order_fulfillment_status)
+# what_if(idx, "order_fulfillment_status", "On-time")
+# what_if(idx, "hour", 6)
